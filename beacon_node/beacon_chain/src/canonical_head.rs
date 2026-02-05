@@ -552,11 +552,31 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 }
             },
             // There was an error recomputing the head.
+            //
+            // IMPORTANT: This error is intentionally swallowed (logged but not propagated).
+            // The rationale is documented in the `recompute_head_at_slot` function's doc comment:
+            // if fork choice fails, we still need the beacon chain to keep importing blocks
+            // so the situation can be rectified.
+            //
+            // However, this means the cached head is NOT updated when fork choice fails.
+            // Block production will use the stale cached head, which may cause:
+            // - Building on an invalid execution payload parent
+            // - EL rejecting forkchoiceUpdated calls
+            // - Missed block proposals
+            //
+            // The `is_healthy()` function checks for invalid execution status and should
+            // prevent block production from proceeding in these cases.
             Ok(Err(e)) => {
                 metrics::inc_counter(&metrics::FORK_CHOICE_ERRORS);
                 error!(
                     error = ?e,
-                    "Error whist recomputing head"
+                    info = "Fork choice failed to find a valid head. The cached head was NOT updated. \
+                    Block production may fail if the cached head has an invalid execution payload. \
+                    This typically occurs when: (1) All descendants of the justified checkpoint \
+                    have invalid execution payloads, (2) There's a consensus bug between EL clients \
+                    (e.g., EIP-7928 BAL hash mismatch), or (3) The EL is rejecting valid blocks. \
+                    The node will continue importing blocks to potentially recover.",
+                    "Error whilst recomputing head"
                 );
             }
             // There was an error spawning the task.

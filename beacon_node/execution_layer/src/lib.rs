@@ -169,6 +169,18 @@ pub enum Error {
     BeaconStateError(BeaconStateError),
     PayloadTypeMismatch,
     VerifyingVersionedHashes(versioned_hashes::Error),
+    /// The parent block's execution payload has been marked as INVALID by the execution layer.
+    ///
+    /// This error indicates that block production cannot proceed because:
+    /// 1. The execution layer has explicitly rejected the parent payload
+    /// 2. Any forkchoiceUpdated call with this parent will fail
+    /// 3. Neither builder nor local EL can produce a valid payload
+    ///
+    /// This typically occurs due to:
+    /// - EIP-7928 (BAL) hash mismatches between different EL client implementations
+    /// - Fork choice failing to update the cached head after payload invalidation
+    /// - Consensus bugs causing disagreement between EL clients
+    InvalidPayloadParent,
 }
 
 impl From<ssz_types::Error> for Error {
@@ -404,11 +416,33 @@ pub struct BuilderParams {
     pub chain_health: ChainHealth,
 }
 
-#[derive(PartialEq)]
+/// Represents the health status of the beacon chain for block production decisions.
+///
+/// This enum is used during block proposal to determine whether to use the builder API
+/// or fall back to local execution client, and whether block production should proceed at all.
+#[derive(Debug, PartialEq)]
 pub enum ChainHealth {
+    /// The chain is healthy and block production can proceed normally.
     Healthy,
+    /// The chain is unhealthy due to network conditions (skips, finalization lag).
+    /// Block production will fall back to the local execution client.
     Unhealthy(FailedCondition),
+    /// The chain head has not been fully validated by the execution layer yet.
+    /// Block production will fall back to the local execution client.
     Optimistic,
+    /// The parent block for the proposed block has an invalid execution payload.
+    ///
+    /// This is a critical condition where:
+    /// 1. The execution layer has explicitly marked the parent's payload as INVALID
+    /// 2. Any attempt to build on this parent will fail
+    /// 3. Block production should NOT proceed - neither builder nor local EL can help
+    ///
+    /// This typically occurs when:
+    /// - There's a consensus bug causing different EL clients to disagree on validity
+    /// - The fork choice head hasn't been updated after payload invalidation
+    /// - All descendants of the justified checkpoint have invalid execution payloads
+    InvalidExecutionHead,
+    /// The chain is pre-merge and doesn't require execution layer interaction.
     PreMerge,
 }
 
@@ -1050,30 +1084,75 @@ impl<E: EthSpec> ExecutionLayer<E> {
 
         // check chain health
         if builder_params.chain_health != ChainHealth::Healthy {
-            // chain is unhealthy, gotta use local payload
+            // chain is unhealthy, handle based on the specific condition
             match builder_params.chain_health {
-                ChainHealth::Unhealthy(condition) => info!(
-                    info = "this helps protect the network. the --builder-fallback flags \
-                    can adjust the expected health conditions.",
-                failed_condition = ?condition,
-                    "Chain is unhealthy, using local payload"
-                ),
+                ChainHealth::Unhealthy(condition) => {
+                    info!(
+                        info = "this helps protect the network. the --builder-fallback flags \
+                        can adjust the expected health conditions.",
+                        failed_condition = ?condition,
+                        "Chain is unhealthy, using local payload"
+                    );
+                    // Fall back to local payload - this can still succeed
+                    return self
+                        .get_full_payload_caching(payload_parameters)
+                        .await
+                        .and_then(GetPayloadResponseType::try_into)
+                        .map(ProvenancedPayload::Local);
+                }
                 // Intentional no-op, so we never attempt builder API proposals pre-merge.
-                ChainHealth::PreMerge => (),
-                ChainHealth::Optimistic => info!(
-                    info = "the local execution engine is syncing and the builder network \
-                    cannot safely be used - unable to propose block",
-                    "Chain is optimistic; can't build payload"
-                ),
+                ChainHealth::PreMerge => {
+                    return self
+                        .get_full_payload_caching(payload_parameters)
+                        .await
+                        .and_then(GetPayloadResponseType::try_into)
+                        .map(ProvenancedPayload::Local);
+                }
+                ChainHealth::Optimistic => {
+                    info!(
+                        info = "the local execution engine is syncing and the builder network \
+                        cannot safely be used - attempting local payload",
+                        "Chain is optimistic; attempting local payload"
+                    );
+                    // Fall back to local payload - this might succeed if EL catches up
+                    return self
+                        .get_full_payload_caching(payload_parameters)
+                        .await
+                        .and_then(GetPayloadResponseType::try_into)
+                        .map(ProvenancedPayload::Local);
+                }
+                ChainHealth::InvalidExecutionHead => {
+                    // CRITICAL: The parent block's execution payload is INVALID.
+                    //
+                    // This is a fundamentally unrecoverable situation for this block proposal:
+                    // 1. The builder cannot help - it would also need to build on the invalid parent
+                    // 2. The local EL cannot help - it will reject forkchoiceUpdated with this parent
+                    // 3. Any payload request will fail because the EL sees the parent as invalid
+                    //
+                    // Root cause scenarios:
+                    // - EIP-7928 (BAL) hash mismatch between EL clients
+                    // - Consensus bug causing EL to mark valid blocks as invalid
+                    // - Fork choice failed to update cached head after invalidation
+                    //
+                    // The only recovery path is for fork choice to select a different (valid) head,
+                    // which should happen in subsequent slots if valid blocks exist in the tree.
+                    crit!(
+                        parent_hash = ?payload_parameters.parent_hash,
+                        info = "The parent block's execution payload has been marked INVALID by the \
+                        execution layer. Block production cannot proceed. This may indicate: \
+                        (1) A consensus bug between EL clients (e.g., BAL hash mismatch), \
+                        (2) Fork choice failed to update after payload invalidation, or \
+                        (3) All chain heads have invalid execution payloads. \
+                        The node will skip this block proposal and wait for fork choice to \
+                        identify a valid head.",
+                        "Cannot produce block: parent execution payload is INVALID"
+                    );
+                    return Err(Error::InvalidPayloadParent);
+                }
                 ChainHealth::Healthy => {
                     crit!("got healthy but also not healthy.. this shouldn't happen!")
                 }
             }
-            return self
-                .get_full_payload_caching(payload_parameters)
-                .await
-                .and_then(GetPayloadResponseType::try_into)
-                .map(ProvenancedPayload::Local);
         }
 
         let parent_hash = payload_parameters.parent_hash;

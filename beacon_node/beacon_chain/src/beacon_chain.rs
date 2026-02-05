@@ -7161,8 +7161,39 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     ///
     /// Since we are likely calling this during the slot we are going to propose in, don't take into
     /// account the current slot when accounting for skips.
+    ///
+    /// # Execution Status Checks
+    ///
+    /// This function performs critical validation of the parent block's execution status:
+    ///
+    /// 1. **Invalid**: If the parent's execution payload has been explicitly marked as INVALID
+    ///    by the execution layer, block production MUST NOT proceed. This is a fundamental
+    ///    consensus failure condition - the EL will reject any forkchoiceUpdated call with
+    ///    this parent as head.
+    ///
+    /// 2. **Optimistic**: If the parent hasn't been fully validated yet, we can still attempt
+    ///    local block production (the EL might catch up), but builder API should not be used.
+    ///
+    /// # Why This Check Matters
+    ///
+    /// When the execution layer returns INVALID for a block (e.g., due to EIP-7928 BAL hash
+    /// mismatch), fork choice should recompute the head to find a valid alternative. However,
+    /// if fork choice fails (e.g., all descendants of the justified checkpoint are invalid),
+    /// the cached head may remain stale, pointing to the invalid block.
+    ///
+    /// Without this check, block production would:
+    /// 1. Read the stale cached head
+    /// 2. Extract the invalid execution payload's block hash as the parent
+    /// 3. Send forkchoiceUpdated to the EL with the invalid parent
+    /// 4. EL rejects with INVALID or returns no payload_id
+    /// 5. Block production fails silently
+    ///
+    /// By checking for INVALID status here, we can fail fast with a clear error message
+    /// rather than wasting time on a request that will inevitably fail.
     pub fn is_healthy(&self, parent_root: &Hash256) -> Result<ChainHealth, Error> {
         let cached_head = self.canonical_head.cached_head();
+        let head_block_root = cached_head.head_block_root();
+
         if let Some(head_hash) = cached_head.forkchoice_update_parameters().head_hash {
             if ExecutionBlockHash::zero() == head_hash {
                 return Ok(ChainHealth::PreMerge);
@@ -7171,15 +7202,63 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Ok(ChainHealth::PreMerge);
         };
 
-        // Check that the parent is NOT optimistic.
-        if let Some(execution_status) = self
-            .canonical_head
-            .fork_choice_read_lock()
-            .get_block_execution_status(parent_root)
-            && execution_status.is_strictly_optimistic()
+        // Check the execution status of BOTH the cached head and the parent block.
+        //
+        // CRITICAL: We must check for INVALID status first, before checking for Optimistic.
+        // An INVALID block is a fundamentally unrecoverable condition for this block proposal:
+        // - The EL has explicitly rejected this block's execution payload
+        // - Any forkchoiceUpdated call with this block will fail
+        // - Neither builder nor local EL can produce a valid payload
+        //
+        // This situation typically arises from:
+        // 1. EIP-7928 (BAL) hash mismatches between different EL client implementations
+        // 2. Fork choice failing to update the cached head after payload invalidation
+        // 3. Consensus bugs causing different ELs to disagree on block validity
+        //
+        // We check BOTH the cached head and the parent because:
+        // - The cached head provides the state from which we derive the execution payload parent
+        // - The parent_root is the beacon block we're building on top of
+        // - If either is invalid, block production will fail
+        let fork_choice = self.canonical_head.fork_choice_read_lock();
+
+        // First, check the cached head's execution status.
+        // If the cached head is invalid, the execution payload's parent (derived from
+        // the cached head's state) will also be invalid.
+        if let Some(head_execution_status) =
+            fork_choice.get_block_execution_status(&head_block_root)
         {
-            return Ok(ChainHealth::Optimistic);
+            if head_execution_status.is_invalid() {
+                warn!(
+                    head_block_root = ?head_block_root,
+                    parent_root = ?parent_root,
+                    "Cached head has invalid execution payload - block production cannot proceed. \
+                    This indicates fork choice failed to update after payload invalidation."
+                );
+                return Ok(ChainHealth::InvalidExecutionHead);
+            }
         }
+
+        // Then, check the parent block's execution status.
+        // This may be the same as the cached head (if building on the head) or different
+        // (if there were empty slots between the head and the proposal slot).
+        if let Some(parent_execution_status) = fork_choice.get_block_execution_status(parent_root) {
+            if parent_execution_status.is_invalid() {
+                warn!(
+                    head_block_root = ?head_block_root,
+                    parent_root = ?parent_root,
+                    "Parent block has invalid execution payload - block production cannot proceed."
+                );
+                return Ok(ChainHealth::InvalidExecutionHead);
+            }
+            if parent_execution_status.is_strictly_optimistic() {
+                // The parent hasn't been fully validated yet.
+                // Local block production might still succeed if the EL catches up.
+                return Ok(ChainHealth::Optimistic);
+            }
+        }
+
+        // Release the fork choice lock before proceeding with other checks
+        drop(fork_choice);
 
         if self.config.builder_fallback_disable_checks {
             return Ok(ChainHealth::Healthy);

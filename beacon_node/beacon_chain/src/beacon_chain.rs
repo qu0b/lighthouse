@@ -915,6 +915,14 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Ok(Some(self.genesis_state_root));
         } else if request_slot > self.slot()? {
             return Ok(None);
+        } else if request_slot
+            > self.canonical_head.cached_head().head_slot() + T::EthSpec::slots_per_epoch()
+        {
+            // Beyond a small window above the head the "all intervening slots are skipped"
+            // assumption made below is not justified: on a node that has fallen behind those
+            // slots are unprocessed, not skipped, and claiming the stale head state root for
+            // them fabricates a root for a slot the node has never processed.
+            return Ok(None);
         }
 
         // Check limits w.r.t historic state bounds.
